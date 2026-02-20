@@ -1,0 +1,28 @@
+defaults:
+  snmp_version: "v2c"
+  community: "public"
+  timeout_s: 2.5
+  retries: 1
+  target_budget_s: 10
+  oids:
+    - "sysUpTime.0"
+    - "sysName.0"
+    - "sysDescr.0"
+    - "sysLocation.0"
+
+targets:
+  - name: "SimonsRouter"
+    ip: "172.16.0.179"
+
+  - name: "MarlasRouter"
+    ip: "172.16.0.181"
+
+  - name: "StinasSwitch"
+    ip: "172.16.0.235"
+
+  - name: "någonsSwitch"
+    ip: "172.16.0.250"
+
+  - name: "awlv"
+    ip: "172.16.0.251"
+
