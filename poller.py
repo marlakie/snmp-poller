@@ -1,264 +1,284 @@
 #!/usr/bin/env python3
 
-
-# SNMP Poller
-# What this script does:
-#  1) Reads config.yml (YAML -> Python dict)
-#  2) Validates that config contains required keys
-#  3) For each target (device):
-#       - Polls a list of OIDs using the Net-SNMP command "snmpget"
-#       - Uses retries ONLY when the error is a timeout
-#       - Stops polling that target if target_budget_s is exceeded
-#  4) Prints JSON output (always)
-#  5) Returns exit codes:
-#       0 = all OK
-#       1 = partial (some OK data but also errors)
-#       2 = total fail (no data at all) OR config invalid
-
+import argparse
 import json
+import logging
 import subprocess
-import sys
 import time
+from datetime import datetime, UTC
+from pathlib import Path
+
 import yaml
 
 
-# SECTION A: CONFIG HANDLING
-
-def load_config(path="config.yml"):
-    """
-    PURPOSE:
-      Read config.yml and convert YAML -> Python dictionary (dict).
-    WHY:
-      This makes the script config-driven (no hardcoded IPs/OIDs in code).
-    """
+# Read YAML config file
+def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
+# Validate config structure
 def validate_config(cfg):
-    """
-    PURPOSE:
-      Check that config contains the keys we need.
-    WHY:
-      If config is wrong, we want a clear error and exit code 2.
-      This prevents confusing runtime errors later.
-    WHAT WE CHECK:
-      - Top level: defaults + targets
-      - defaults contains required settings
-      - defaults.oids is a list
-      - targets is a list with at least 2 entries
-      - each target has name + ip
-    """
-    # Must contain these top-level keys
     if "defaults" not in cfg or "targets" not in cfg:
         raise ValueError("Config must contain 'defaults' and 'targets'")
 
     defaults = cfg["defaults"]
     targets = cfg["targets"]
 
-    # Required keys in defaults
-    required = ["snmp_version", "community", "timeout_s", "retries", "target_budget_s", "oids"]
-    for k in required:
-        if k not in defaults:
-            raise ValueError(f"'defaults' missing: {k}")
+    required = ["snmp_version", "timeout_s", "retries", "target_budget_s", "oids"]
+    for key in required:
+        if key not in defaults:
+            raise ValueError(f"'defaults' missing: {key}")
 
-    # OIDs must be a non-empty list
     if not isinstance(defaults["oids"], list) or len(defaults["oids"]) < 1:
-        raise ValueError("'defaults.oids' must be a list with at least 1 OID")
+        raise ValueError("'defaults.oids' must be a non-empty list")
 
-    # Must have at least 2 targets
     if not isinstance(targets, list) or len(targets) < 2:
         raise ValueError("'targets' must be a list with at least 2 targets")
 
-    # Each target must have name and ip
+    # Basic type checks
+    try:
+        float(defaults["timeout_s"])
+        int(defaults["retries"])
+        float(defaults["target_budget_s"])
+    except Exception:
+        raise ValueError("timeout_s, retries and target_budget_s must be numeric")
+
     for t in targets:
         if not isinstance(t, dict):
             raise ValueError("Each target must be a dict")
         if "name" not in t or "ip" not in t:
             raise ValueError("Each target must contain 'name' and 'ip'")
 
-        # If a target has extra OIDs, they must be a list
+        # Allow community either on target or in defaults
+        if "community" not in t and "community" not in defaults:
+            raise ValueError(
+                f"Target '{t.get('name')}' must have 'community', or defaults must define it"
+            )
+
         if "oids" in t and not isinstance(t["oids"], list):
-            raise ValueError(f"Target '{t.get('name')}' has invalid 'oids' (must be a list)")
+            raise ValueError(f"Target '{t.get('name')}' has invalid 'oids'")
 
 
+# Merge defaults with a single target
+def merge_defaults(defaults, target):
+    merged = {
+        "name": target["name"],
+        "ip": target["ip"],
+        "community": target.get("community", defaults.get("community")),
+        "snmp_version": defaults["snmp_version"],
+        "timeout_s": float(defaults["timeout_s"]),
+        "retries": int(defaults["retries"]),
+        "target_budget_s": float(defaults["target_budget_s"]),
+        "oids": list(defaults["oids"]),
+    }
 
-# SECTION B: SNMP FUNCTION (one request)
-def snmpget_v2c(ip, community, oid, timeout_s):
-    """
-    PURPOSE:
-      Poll ONE OID from ONE device using "snmpget".
-    WHY:
-      Lab recommends using Net-SNMP CLI tools via subprocess.
-
-    COMMAND WE RUN:
-      snmpget -v2c -c <community> -t <timeout> -r 0 -Oqv <ip> <oid>
-
-    IMPORTANT FLAGS:
-      -v2c     : SNMP version 2c
-      -c       : community string (like a password for SNMPv2c)
-      -t       : timeout per request (seconds)
-      -r 0     : retries handled by OUR code, so snmpget itself should not retry
-      -Oqv     : output only the VALUE (makes parsing easy for JSON)
-
-    RETURNS:
-      (True, value) on success
-      (False, "timeout") if device does not respond
-      (False, "auth") if community/auth is wrong
-      (False, "snmp_error") for other errors
-    """
-    cmd = ["snmpget", "-v2c", "-c", community, "-t", str(timeout_s), "-r", "0", "-Oqv", ip, oid]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-
-    # returncode 0 means success
-    if p.returncode == 0:
-        return True, p.stdout.strip()
-
-    # if error, Net-SNMP usually writes to stderr
-    err = (p.stderr or p.stdout or "").strip()
-
-    # classify common errors so we can apply correct logic
-    if "Timeout" in err or "No Response" in err:
-        return False, "timeout"
-    if "Authentication failure" in err or "authorizationError" in err:
-        return False, "auth"
-
-    return False, "snmp_error"
-
-
-# SECTION C: POLL ONE TARGET (multiple OIDs)
-def poll_target(target, defaults):
-    """
-    PURPOSE:
-      Poll ONE device (target) for ALL OIDs.
-    FEATURES:
-      1) OID list = defaults.oids + optional target.oids
-      2) target_budget_s = maximum time allowed for this device
-         -> prevents a down device from blocking the entire run
-      3) retries only on timeout:
-         - timeout: retry up to <retries>
-         - auth: fail-fast (retry doesn't help)
-    """
-    name = target["name"]
-    ip = target["ip"]
-
-    # Settings are read from config (config-driven)
-    community = defaults["community"]
-    timeout_s = float(defaults["timeout_s"])
-    retries = int(defaults["retries"])
-    budget_s = float(defaults["target_budget_s"])
-
-    # Build OID list (keep defaults first, then target-specific, no duplicates)
-    oids = list(defaults["oids"])
+    # Add target-specific OIDs without duplicates
     if "oids" in target:
         for oid in target["oids"]:
-            if oid not in oids:
-                oids.append(oid)
+            if oid not in merged["oids"]:
+                merged["oids"].append(oid)
 
-    # Budget handling: we compute a deadline time
+    return merged
+
+
+# Build snmpget command
+def build_snmpget_cmd(target, oid):
+    return [
+        "snmpget",
+        "-v2c",
+        "-c",
+        target["community"],
+        "-r",
+        "0",           # retries handled by our code
+        "-Oqv",        # value only
+        target["ip"],
+        oid,
+    ]
+
+
+# Run one SNMP request
+def run_snmpget(cmd, timeout_s):
+    start = time.time()
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        elapsed = time.time() - start
+
+        if p.returncode == 0:
+            return True, p.stdout.strip(), elapsed
+
+        err = (p.stderr or p.stdout or "").strip()
+
+        if "Timeout" in err or "No Response" in err:
+            return False, "timeout", elapsed
+        if "Authentication failure" in err or "authorizationError" in err:
+            return False, "auth", elapsed
+        if "Unknown host" in err or "Name or service not known" in err:
+            return False, "unreachable", elapsed
+
+        return False, "snmp_error", elapsed
+
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - start
+        return False, "timeout", elapsed
+
+
+# Poll one target
+def poll_target(target):
+    name = target["name"]
+    ip = target["ip"]
+    retries = target["retries"]
+    budget_s = target["target_budget_s"]
+    timeout_s = target["timeout_s"]
+    oids = target["oids"]
+
+    logging.info("Target start name=%s ip=%s oids=%d", name, ip, len(oids))
+
     start = time.time()
     deadline = start + budget_s
 
-    data = {}      # on success: data[oid] = value
-    errors = []    # on failure: {"oid": oid, "error": "..."} appended here
+    oid_results = {}
+    ok_count = 0
+    fail_count = 0
 
-    # Poll OID by OID
     for oid in oids:
-
-        # If our time budget for this target is over, stop immediately
         if time.time() >= deadline:
-            errors.append({"oid": oid, "error": "budget_exceeded"})
+            oid_results[oid] = {"ok": False, "error": "budget_exceeded"}
+            fail_count += 1
+            logging.warning("Budget exceeded for target=%s ip=%s", name, ip)
             break
 
         attempt = 0
         while True:
             attempt += 1
+            cmd = build_snmpget_cmd(target, oid)
+            ok, value_or_error, _elapsed = run_snmpget(cmd, timeout_s)
 
-            ok, val = snmpget_v2c(ip, community, oid, timeout_s)
-
-            # SUCCESS: store value and go to next OID
             if ok:
-                data[oid] = val
+                oid_results[oid] = {"ok": True, "value": value_or_error}
+                ok_count += 1
                 break
 
-            # AUTH ERROR: fail-fast (retries won't fix wrong community)
-            if val == "auth":
-                errors.append({"oid": oid, "error": "auth"})
+            # Fail fast on auth
+            if value_or_error == "auth":
+                oid_results[oid] = {"ok": False, "error": "auth"}
+                fail_count += 1
+                logging.error("Auth failure target=%s ip=%s oid=%s", name, ip, oid)
                 break
 
-            # TIMEOUT: retry while attempt <= retries
-            if val == "timeout" and attempt <= retries:
+            # Retry only on timeout/unreachable
+            if value_or_error in ("timeout", "unreachable") and attempt <= retries:
+                logging.warning(
+                    "Retry target=%s ip=%s oid=%s attempt=%d/%d reason=%s",
+                    name, ip, oid, attempt, retries, value_or_error
+                )
                 continue
 
-            # OTHER ERRORS (or no retries left): record error and stop retry loop
-            errors.append({"oid": oid, "error": val})
+            oid_results[oid] = {"ok": False, "error": value_or_error}
+            fail_count += 1
+
+            if value_or_error in ("timeout", "unreachable"):
+                logging.warning("Timeout/unreachable target=%s ip=%s oid=%s", name, ip, oid)
+            else:
+                logging.error(
+                    "SNMP error target=%s ip=%s oid=%s err=%s",
+                    name,
+                    ip,
+                    oid,
+                    value_or_error,
+                )
             break
 
     duration = time.time() - start
 
-    # ok_target means "no errors at all for this target"
-    ok_target = (len(errors) == 0)
+    if ok_count == len(oids) and fail_count == 0:
+        status = "ok"
+    elif ok_count > 0:
+        status = "partial"
+    else:
+        status = "failed"
 
-    # Return a JSON-friendly dict for this target
+    logging.info("Target end name=%s ip=%s status=%s duration=%.3f", name, ip, status, duration)
+
     return {
         "name": name,
         "ip": ip,
-        "ok": ok_target,
+        "status": status,
+        "oid_results": oid_results,
+        "ok_count": ok_count,
+        "fail_count": fail_count,
         "duration_s": round(duration, 3),
-        "data": data,
-        "errors": errors,
     }
 
-# SECTION D: MAIN (run everything + JSON output + exit codes)
-def main():
-    """
-    PURPOSE:
-      The main entry point.
-      - reads config path from argv (default: config.yml)
-      - validates config
-      - polls all targets
-      - prints JSON output
-      - returns exit code 0/1/2
-    """
-    # Allow: ./poller.py config.yml
-    cfg_path = "config.yml"
-    if len(sys.argv) > 1:
-        cfg_path = sys.argv[1]
 
-    # Read + validate config
+def setup_logging(level_name):
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s")
+
+
+# Main function
+def main():
+    parser = argparse.ArgumentParser(description="Simple SNMP poller")
+    parser.add_argument("--config", required=True, help="Path to config.yml")
+    parser.add_argument("--out", required=True, help="Output JSON file, or - for stdout")
+    parser.add_argument("--log-level", default="INFO", help="Logging level (INFO/WARNING/ERROR)")
+    args = parser.parse_args()
+
+    setup_logging(args.log_level)
+
+    run_start = time.time()
+    cfg_path = args.config
+
     try:
         cfg = load_config(cfg_path)
         validate_config(cfg)
     except Exception as e:
-        # Config invalid -> JSON error + exit code 2
-        print(json.dumps({"ok": False, "error": "config_invalid", "details": str(e)}, indent=2))
+        logging.error("Config error: %s", e)
+        out = {"ok": False, "error": "config_invalid", "details": str(e)}
+        if args.out == "-":
+            print(json.dumps(out, indent=2))
+        else:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
         return 2
 
     defaults = cfg["defaults"]
     targets = cfg["targets"]
 
-    results = []
-    any_data = False     # true if we got ANY SNMP values from any target
-    any_errors = False   # true if ANY target had errors
+    logging.info("Run start targets=%d out=%s", len(targets), args.out)
 
-    # Poll all targets one by one
+    results = []
+    any_data = False
+    any_errors = False
+
     for t in targets:
-        r = poll_target(t, defaults)
+        merged_target = merge_defaults(defaults, t)
+        r = poll_target(merged_target)
         results.append(r)
 
-        if len(r["data"]) > 0:
+        if r["ok_count"] > 0:
             any_data = True
-        if len(r["errors"]) > 0:
+        if r["fail_count"] > 0:
             any_errors = True
 
-    # Print JSON output ALWAYS (even if partial)
-    out = {"ok": (any_data and not any_errors), "results": results}
-    print(json.dumps(out, indent=2))
+    run_duration = time.time() - run_start
 
-    # Exit codes for automation (cron/CI):
-    # 2 = total fail (no data at all)
-    # 1 = partial (some data but also errors)
-    # 0 = all ok
+    out = {
+        "run": {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "config_file": str(Path(cfg_path).name),
+            "duration_s": round(run_duration, 3),
+        },
+        "ok": (any_data and not any_errors),
+        "targets": results,
+    }
+
+    if args.out == "-":
+        print(json.dumps(out, indent=2))
+    else:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+
     if not any_data:
         return 2
     if any_errors:
@@ -266,6 +286,5 @@ def main():
     return 0
 
 
-# Standard Python pattern: run main() only when executed directly
 if __name__ == "__main__":
     raise SystemExit(main())

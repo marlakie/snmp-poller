@@ -25,14 +25,7 @@ source .venv/bin/activate
 pip install pyyaml
 ```
 
-
-# Config format (`config.yml`)
-Top level keys:
-- `defaults` — global SNMP settings and default OIDs
-- `targets` — list of devices to poll
-
-Example structure:
-```yaml
+##Config format (config.yml)
 defaults:
   snmp_version: "v2c"
   community: "public"
@@ -48,27 +41,57 @@ defaults:
 targets:
   - name: "Switch1"
     ip: "172.16.0.179"
+
   - name: "MyRouter"
     ip: "172.16.0.181"
+
   - name: "Switch2"
     ip: "172.16.0.235"
-```
 
-# Run unit tests (no SNMP needed)
+##Run unit tests
 ```bash
 python3 -m unittest -v
 ```
 
-# Run the poller
+#Run the Poller (print JSON to terminal)
 ```bash
-./poller.py config.yml
+python3 poller.py --config config.yml --out -
 echo $?
 ```
+##Run the poller (print JSON to file)
+```bash
+python3 poller.py --config config.yml --out out.json
+echo $?
+cat out.json
+```
 
-- `results[]` per target
-  - `data` (OID -> value) on success
-  - `errors` on failure (e.g. `timeout`, `auth`, `budget_exceeded`)
-# Exit codes
-- `0` = all OK
-- `1` = partial success (some data + some errors)
-- `2` = total failure (no data) OR config invalid
+#The poller uses log levels:
+
+INFO for normal run/target start and end
+WARNING for retries, timeouts, and budget exceeded
+ERROR for config errors and authentication errors
+
+example: python3 poller.py --config config.yml --out out.json --log-level INFO
+
+#Output format
+The script writes JSON output with:
+run
+timestamp
+config_file
+duration_s
+ok (overall run status)
+targets[]
+name
+ip
+status (ok, partial, or failed)
+oid_results
+ok_count
+fail_count
+duration_s
+
+#Exit codes
+0 = all OK
+
+1 = partial success (some data collected, but there were errors)
+
+2 = total failure (no data collected) or invalid config
