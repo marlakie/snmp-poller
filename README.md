@@ -25,8 +25,9 @@ source .venv/bin/activate
 pip install pyyaml
 ```
 
-##Config format (config.yml)
-defaults:
+## Config format (config.yml)
+```bash
+  defaults:
   snmp_version: "v2c"
   community: "public"
   timeout_s: 2.5
@@ -47,6 +48,7 @@ targets:
 
   - name: "Switch2"
     ip: "172.16.0.235"
+```
 
 ##Run unit tests
 ```bash
@@ -66,14 +68,15 @@ cat out.json
 ```
 
 #The poller uses log levels:
-
+```bash
 INFO for normal run/target start and end
 WARNING for retries, timeouts, and budget exceeded
 ERROR for config errors and authentication errors
 
 example: python3 poller.py --config config.yml --out out.json --log-level INFO
-
+```
 #Output format
+```bash
 The script writes JSON output with:
 run
 timestamp
@@ -90,8 +93,8 @@ fail_count
 duration_s
 
 #Exit codes
+```bash
 0 = all OK
-
 1 = partial success (some data collected, but there were errors)
-
 2 = total failure (no data collected) or invalid config
+```
